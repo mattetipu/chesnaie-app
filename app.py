@@ -1,189 +1,330 @@
 import streamlit as st
 import pandas as pd
-import datetime
+import requests
+import datetime as dt
 from io import BytesIO
 
-# --- CONFIGURATION PROJET ---
-st.set_page_config(page_title="Smart Pricing Chesnaie - Multi-Concurrents", page_icon="📊", layout="wide")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Smart Pricing Chesnaie - V3.4", page_icon="📈", layout="wide")
 
-# --- 1. BASE DE DONNÉES CONCURRENTS (Fiabilité) ---
-# Liste extraite de votre fichier CONCURRENTS.csv et Source [49, 50]
-# 'poids': Importance du concurrent (1.0 = Concurrent direct, 0.5 = Concurrent éloigné)
-COMPETITORS_DB = {
-    "Bois de la Justice": {"url": "https://www.campingleboisdelajustice.com", "dist": "10km", "poids": 1.0, "type": "Indépendant"},
-    "Ile de Boulancourt": {"url": "https://www.campingiledeboulancourt.com", "dist": "14km", "poids": 0.9, "type": "Nature/Insolite"},
-    "Hameau de la Rivière": {"url": "https://www.hameaudelariviere.com", "dist": "14km", "poids": 0.8, "type": "Indépendant"},
-    "Camping des Bondons": {"url": "https://www.camping-des-bondons.com", "dist": "23km", "poids": 0.6, "type": "Indépendant"},
-    "La Musardière": {"url": "https://lamusardiere.fr", "dist": "26km", "poids": 0.6, "type": "Nature"},
-    "Benchmark Chaines (Siblu/CapFun)": {"url": "Generic", "dist": "41", "poids": 0.5, "type": "Chaîne"} # Référence tarifaire [cite: 50]
+# Base de connaissance concurrents (Prix planchers/plafonds)
+COMPETITOR_KNOWLEDGE_BASE = {
+    "BASSE_SAISON": {"Moyenne": 45, "Max": 60, "Min": 35},
+    "MOYENNE_SAISON": {"Moyenne": 65, "Max": 85, "Min": 50},
+    "HAUTE_SAISON": {"Moyenne": 95, "Max": 130, "Min": 75},
 }
 
-# --- 2. CALENDRIER ÉVÉNEMENTIEL 2026 (Dates confirmées) ---
-EVENTS_CALENDAR = {
-    "KARTING_NSK": {"dates": [(datetime.date(2026, 5, 29), datetime.date(2026, 5, 31))], "impact": 1.20, "label": "Karting NSK National (+20%)"},
-    "KARTING_LIGUE": {"dates": [(datetime.date(2026, 3, 7), datetime.date(2026, 3, 8)), (datetime.date(2026, 6, 27), datetime.date(2026, 6, 28))], "impact": 1.10, "label": "Karting Ligue IDF (+10%)"},
-    "PONT_ASCENSION": {"dates": [(datetime.date(2026, 5, 13), datetime.date(2026, 5, 17))], "impact": 1.30, "label": "Pont Ascension (+30%)"},
-    "PENTECOTE": {"dates": [(datetime.date(2026, 5, 22), datetime.date(2026, 5, 25))], "impact": 1.25, "label": "Pont Pentecôte (+25%)"}
-}
+# Configuration Météo
+LAT, LON = 48.31, 1.99
+OPEN_METEO_URL = (
+    "https://api.open-meteo.com/v1/forecast"
+    f"?latitude={LAT}&longitude={LON}"
+    "&daily=weathercode,temperature_2m_max"
+    "&timezone=Europe%2FParis"
+)
 
-# --- 3. MOTEUR D'ANALYSE DE MARCHÉ ---
+# --- PRÉ-TRAITEMENT DES ÉVÉNEMENTS (Optimisation Performance) ---
+RAW_EVENTS = [
+    {"name": "Pont Ascension", "start": "2026-05-13", "end": "2026-05-17", "mult": 1.25},
+    {"name": "Karting NSK", "start": "2026-05-29", "end": "2026-05-31", "mult": 1.20},
+    {"name": "Pont Pentecôte", "start": "2026-05-22", "end": "2026-05-25", "mult": 1.25},
+]
 
-def get_market_index(check_in_date, product_segment="Locatif"):
+PROCESSED_EVENTS = [
+    {
+        "name": ev["name"],
+        "start": dt.date.fromisoformat(ev["start"]),
+        "end": dt.date.fromisoformat(ev["end"]),
+        "mult": float(ev["mult"]),
+    }
+    for ev in RAW_EVENTS
+]
+
+# --- PARAMÈTRES AJUSTABLES (UX PRO) ---
+st.sidebar.header("⚙️ Paramètres Yield (Ajustables)")
+MAX_CAP_PCT = st.sidebar.slider("Plafond max (%)", min_value=0, max_value=80, value=30, step=1)
+BONUS_SUN_PCT = st.sidebar.slider("Bonus soleil (%)", min_value=0, max_value=20, value=5, step=1)
+MALUS_RAIN_PCT = st.sidebar.slider("Malus pluie (%)", min_value=0, max_value=30, value=5, step=1)
+APPLY_FLOOR = st.sidebar.checkbox("Appliquer plancher marché", value=True)
+
+# --- FONCTIONS UTILITAIRES ---
+def get_season_data(date_obj: dt.date):
+    if date_obj.month in [7, 8]:
+        return "HAUTE_SAISON", COMPETITOR_KNOWLEDGE_BASE["HAUTE_SAISON"]
+    if date_obj.month in [4, 5, 6, 9]:
+        return "MOYENNE_SAISON", COMPETITOR_KNOWLEDGE_BASE["MOYENNE_SAISON"]
+    return "BASSE_SAISON", COMPETITOR_KNOWLEDGE_BASE["BASSE_SAISON"]
+
+
+@st.cache_data(ttl=60 * 30)
+def fetch_weather_daily():
     """
-    Calcule un 'Prix de Marché Moyen' pondéré en fonction de la saison
-    et de la typologie des 6 concurrents.
+    Récupère la météo quotidienne (J..J+7). Mise en cache 30 min.
+    Ne doit pas faire planter l’app : renvoie None en cas d'échec.
     """
-    month = check_in_date.month
-    
-    # Estimation des tarifs de base selon la saison (Simulation réaliste pour éviter blocage robot)
-    # Ces valeurs simulent ce que le scraper récupérerait sur les sites
-    base_prices = {}
-    
-    is_high_season = month in [7, 8]
-    is_shoulder_season = month in [5, 6, 9]
-    
-    # 1. Concurrents Locaux (Bois Justice, Boulancourt...)
-    local_base = 85.0 if is_high_season else (65.0 if is_shoulder_season else 45.0)
-    
-    # 2. Chaines (Siblu/CapFun) - Souvent plus chers et dynamiques [cite: 55]
-    chain_base = 120.0 if is_high_season else (80.0 if is_shoulder_season else 50.0)
+    try:
+        r = requests.get(OPEN_METEO_URL, timeout=6)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
-    # Calcul du prix pour chaque concurrent
-    prices = []
-    total_weight = 0
-    
-    for name, data in COMPETITORS_DB.items():
-        # Variation légère pour chaque concurrent
-        if data['type'] == 'Chaîne':
-            price = chain_base
+
+def wmo_to_bucket(code: int) -> str:
+    """
+    Classification simple mais moins grossière que '>=50 = pluie'.
+    Référence WMO weather codes (approximations utiles côté yield).
+    """
+    try:
+        c = int(code)
+    except Exception:
+        return "NEUTRE"
+
+    # Beau temps
+    if c in [0, 1, 2, 3]:
+        return "SOLEIL"
+
+    # Brouillard
+    if c in [45, 48]:
+        return "BROUILLARD"
+
+    # Pluie / bruine
+    if 51 <= c <= 67 or 80 <= c <= 82:
+        return "PLUIE"
+
+    # Neige / grésil
+    if 71 <= c <= 77 or 85 <= c <= 86:
+        return "NEIGE"
+
+    # Orage
+    if 95 <= c <= 99:
+        return "ORAGE"
+
+    return "NEUTRE"
+
+
+def build_weather_map(dates_in_excel: list[dt.date]) -> tuple[dict, bool]:
+    """
+    Crée un dictionnaire {date: info_météo}.
+    Retourne (weather_map, degraded_mode).
+    degraded_mode=True si l'API est indisponible ou parsing KO.
+    """
+    weather_map = {}
+    api_data = fetch_weather_daily()
+
+    api_map = {}
+    degraded_mode = False
+
+    if not api_data:
+        degraded_mode = True
+    else:
+        try:
+            api_dates = [dt.date.fromisoformat(d) for d in api_data["daily"]["time"]]
+            codes = api_data["daily"]["weathercode"]
+            temps = api_data["daily"]["temperature_2m_max"]
+
+            for d, c, t in zip(api_dates, codes, temps):
+                bucket = wmo_to_bucket(c)
+                if bucket == "SOLEIL":
+                    api_map[d] = {
+                        "type": "SOLEIL",
+                        "score": 1.0 + (BONUS_SUN_PCT / 100.0),
+                        "desc": f"Beau temps ({t}°C)",
+                    }
+                elif bucket in ["PLUIE", "ORAGE", "NEIGE"]:
+                    api_map[d] = {
+                        "type": bucket,
+                        "score": 1.0 - (MALUS_RAIN_PCT / 100.0),
+                        "desc": f"{bucket.title()} prévue ({t}°C)",
+                    }
+                elif bucket == "BROUILLARD":
+                    api_map[d] = {"type": "BROUILLARD", "score": 1.0, "desc": f"Brouillard ({t}°C)"}
+                else:
+                    api_map[d] = {"type": "NEUTRE", "score": 1.0, "desc": f"Nuageux ({t}°C)"}
+
+        except Exception:
+            degraded_mode = True
+            api_map = {}
+
+    for d in dates_in_excel:
+        if d in api_map:
+            weather_map[d] = api_map[d]
         else:
-            price = local_base 
-            if name == "Ile de Boulancourt": price += 10 # Souvent premium/insolite
-            if name == "Hameau de la Rivière": price -= 5
-            
-        prices.append(price * data['poids'])
-        total_weight += data['poids']
-    
-    # Moyenne Pondérée (Market Index)
-    weighted_average = sum(prices) / total_weight
-    return round(weighted_average, 2)
+            # Hors prévision (ou mode dégradé)
+            weather_map[d] = {"type": "SAISON", "score": 1.0, "desc": "Saisonnier (Hors prévision)"}
 
-def apply_pricing_rules(row):
+    return weather_map, degraded_mode
+
+
+def parse_date(value):
+    try:
+        return pd.to_datetime(value, dayfirst=True).date()
+    except Exception:
+        return None
+
+
+def calculate_smart_price(date_obj: dt.date, base_price: float, weather_map: dict):
     """
-    Applique les règles de Yield Management sur la grille importée.
+    Retourne un tuple strict (Nouveau_Prix, Ref_Concurrents, Justification, Statut).
     """
-    current_price = row.get('Tarif_Actuel', 0)
-    target_date = pd.to_datetime(row['Date']).date()
-    
-    # Récupération du prix marché fiable
-    market_index = get_market_index(target_date)
-    
-    new_price = current_price
+    if date_obj is None:
+        return (base_price or 0, "N/A", "ERREUR: Date invalide", "⚪")
+    if base_price is None or pd.isna(base_price) or float(base_price) <= 0:
+        return (0, "N/A", "Prix nul ou absent", "⚪")
+
+    base_price = float(base_price)
+
+    season_key, season_data = get_season_data(date_obj)
     reasons = []
-    status_icon = "⚪" 
+    mult = 1.0
 
-    # --- A. EVÉNEMENTS (Priorité Haute) ---
-    for event_name, data in EVENTS_CALENDAR.items():
-        for start, end in data['dates']:
-            if start <= target_date <= end:
-                # Filtrage segments pour le Karting (Essentiel/Confort uniquement) [cite: 60]
-                if "KARTING" in event_name and row.get('Segment') not in ['Essentiel', 'Confort']:
-                    continue
-                
-                new_price *= data['impact']
-                reasons.append(data['label'])
-                status_icon = "🔴"
+    # 1) Météo
+    w = weather_map.get(date_obj, {"type": "INFO", "score": 1.0, "desc": "Météo inconnue"})
+    if w["type"] == "SOLEIL" and season_key != "HAUTE_SAISON":
+        mult *= w["score"]
+        reasons.append(w["desc"])
+    elif w["type"] in ["PLUIE", "ORAGE", "NEIGE"]:
+        mult *= w["score"]
+        reasons.append(f"Ajustement météo ({w['type'].title()} -{MALUS_RAIN_PCT}%)")
 
-    # --- B. COMPARAISON MARCHÉ (Fiabilité Multi-Concurrents) ---
-    # Règle : Si saturation marché (>80% concurrents complets) -> +15% [cite: 74]
-    # Simulation saturation haute saison
-    if target_date.month == 8 and target_date.day < 15:
-        new_price *= 1.15
-        reasons.append("Marché Saturé (Août) +15%")
-        status_icon = "🔴"
+    # 2) Événements
+    for ev in PROCESSED_EVENTS:
+        if ev["start"] <= date_obj <= ev["end"]:
+            mult *= ev["mult"]
+            reasons.append(ev["name"])
 
-    # Règle de positionnement prix
-    price_gap = ((current_price - market_index) / market_index) * 100
-    
-    if price_gap > 20:
-        reasons.append(f"⚠️ 20% + cher que le marché (Moy: {market_index}€)")
-        status_icon = "🟠"
-    elif price_gap < -20 and status_icon == "⚪":
-        # Opportunité de monter le prix si on est vraiment moins cher
-        new_price *= 1.05
-        reasons.append(f"Opportunité (20% - cher que marché)")
-        status_icon = "🟢"
+    # 3) Calcul + garde-fous
+    final_price = base_price * mult
 
-    # --- C. DISTRIBUTION (OTA) ---
-    price_ota = new_price * 1.15 # [cite: 106]
+    # Plafond
+    cap_mult = 1.0 + (MAX_CAP_PCT / 100.0)
+    max_price = base_price * cap_mult
+    if final_price > max_price:
+        final_price = max_price
+        reasons.append(f"(Plafonné +{MAX_CAP_PCT}%)")
 
-    return pd.Series([
-        round(new_price, 2), 
-        round(price_ota, 2), 
-        market_index, 
-        " + ".join(reasons) if reasons else "Aligné Marché",
-        status_icon
-    ])
+    # Plancher marché
+    if APPLY_FLOOR and final_price < season_data["Min"]:
+        final_price = float(season_data["Min"])
+        reasons.append(f"Plancher Marché ({season_data['Min']}€)")
+
+    # Statut visuel
+    if final_price > base_price:
+        status = "🟢"
+    elif final_price < base_price:
+        status = "🔴"
+    else:
+        status = "⚪"
+
+    return (
+        round(final_price, 2),
+        f"{season_data['Moyenne']}€",
+        " + ".join(reasons) if reasons else "Standard",
+        status,
+    )
+
 
 # --- INTERFACE UTILISATEUR ---
+st.title("📈 Smart Pricing Chesnaie - V3.4")
+st.caption("V3.4 corrigée : météo batch + mode dégradé + WMO affiné + paramètres yield + gestion erreurs.")
 
-st.title("📊 Smart Pricing - Analyse Multi-Concurrents")
-st.info(f"Analyse active sur {len(COMPETITORS_DB)} concurrents (Bois de la Justice, Boulancourt, St Chéron, Bondons, Musardière, Chaînes).")
-
-uploaded_file = st.file_uploader("📂 Importer votre grille 2026 (CSV/Excel)", type=['csv', 'xlsx'])
+uploaded_file = st.file_uploader("📂 Importez votre fichier CSV ou Excel", type=["csv", "xlsx"])
 
 if uploaded_file:
-    try:
-        # Chargement
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file, sep=None, engine='python')
-        else:
-            df = pd.read_excel(uploaded_file)
+    # Lecture fichier robuste
+    if uploaded_file.name.endswith(".csv"):
+        try:
+            df_raw = pd.read_csv(uploaded_file, sep=None, engine="python")
+        except Exception:
+            df_raw = pd.read_csv(uploaded_file, sep=";")
+    else:
+        df_raw = pd.read_excel(uploaded_file)
 
-        # Mapping Colonnes
-        col1, col2, col3 = st.columns(3)
-        date_col = col1.selectbox("Colonne Date", df.columns)
-        price_col = col2.selectbox("Colonne Prix", df.columns)
-        cat_col = col3.selectbox("Colonne Catégorie", df.columns)
+    df = df_raw.copy()
 
-        # Nettoyage
-        df['Date'] = pd.to_datetime(df[date_col], errors='coerce')
-        df['Tarif_Actuel'] = pd.to_numeric(df[price_col], errors='coerce')
-        # Segmentation automatique simplifiée pour l'algo
-        df['Segment'] = df[cat_col].astype(str).apply(lambda x: "Essentiel" if "2ch" in x.lower() or "eco" in x.lower() else "Confort")
-        df = df.dropna(subset=['Date'])
+    # Détection colonnes
+    col_date_guess = [c for c in df.columns if "date" in c.lower() or "start" in c.lower()]
+    col_price_guess = [c for c in df.columns if "price" in c.lower() or "tarif" in c.lower()]
 
-        if st.button("LANCER L'ANALYSE FIABILISÉE"):
-            with st.spinner('Scan du panier concurrentiel et application des règles...'):
-                
-                # Calcul
-                result = df.apply(apply_pricing_rules, axis=1)
-                df[['Nouveau_Prix', 'Prix_Booking', 'Prix_Moyen_Marché', 'Analyse', 'Statut']] = result
+    c1, c2 = st.columns(2)
+    date_col = c1.selectbox(
+        "Colonne DATE", df.columns, index=df.columns.get_loc(col_date_guess[0]) if col_date_guess else 0
+    )
+    price_col = c2.selectbox(
+        "Colonne PRIX", df.columns, index=df.columns.get_loc(col_price_guess[0]) if col_price_guess else 0
+    )
 
-                # --- DASHBOARD DE RÉSULTAT ---
-                st.markdown("### 📈 Synthèse de positionnement")
-                
-                c1, c2, c3 = st.columns(3)
-                avg_market = df['Prix_Moyen_Marché'].mean()
-                avg_chesnaie = df['Nouveau_Prix'].mean()
-                
-                c1.metric("Prix Moyen Marché (6 concurrents)", f"{avg_market:.2f} €")
-                c2.metric("Votre Prix Optimisé", f"{avg_chesnaie:.2f} €", delta=f"{avg_chesnaie - avg_market:.2f} € vs Marché")
-                c3.metric("Jours modifiés", len(df[df['Statut'] != "⚪"]))
+    # Préparation données (sans perdre l’info : on garde un rapport d’erreurs)
+    df["_date_obj"] = df[date_col].apply(parse_date)
+    df["Price"] = pd.to_numeric(df[price_col], errors="coerce")
 
-                # Graphique Comparatif
-                st.line_chart(df.set_index('Date')[['Tarif_Actuel', 'Nouveau_Prix', 'Prix_Moyen_Marché']])
+    df_errors = df[df["_date_obj"].isna() | df["Price"].isna() | (df["Price"] <= 0)].copy()
+    df_valid = df.dropna(subset=["_date_obj", "Price"]).copy()
+    df_valid = df_valid[df_valid["Price"] > 0].copy()
 
-                # Tableau des alertes
-                st.markdown("### ⚠️ Actions Requises")
-                st.dataframe(df[df['Statut'] != "⚪"][['Date', 'Segment', 'Tarif_Actuel', 'Nouveau_Prix', 'Prix_Moyen_Marché', 'Analyse']], use_container_width=True)
+    if len(df_errors) > 0:
+        st.warning(
+            f"⚠️ {len(df_errors)} lignes ignorées (date invalide et/ou prix manquant/nul). "
+            "Elles seront disponibles dans l’export (onglet 'Erreurs')."
+        )
 
-                # Export
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False)
-                
-                st.download_button("📥 Télécharger Grille Optimisée", output.getvalue(), "Grille_Fiabilisee_2026.xlsx")
+    if st.button("🚀 LANCER L'ANALYSE"):
+        with st.spinner("Récupération Météo & Calculs Yield..."):
+            # Météo batch
+            unique_dates = sorted(df_valid["_date_obj"].unique())
+            weather_map, degraded_mode = build_weather_map(unique_dates)
 
-    except Exception as e:
-        st.error(f"Erreur : {e}")
+            if degraded_mode:
+                st.warning("⚠️ Mode dégradé météo : API indisponible ou parsing en échec. Calcul sans météo réelle.")
+
+            # Calcul
+            results = df_valid.apply(
+                lambda r: calculate_smart_price(r["_date_obj"], r["Price"], weather_map),
+                axis=1,
+            )
+            df_valid[["Nouveau_Prix", "Ref_Concurrents", "Justification", "Statut"]] = pd.DataFrame(
+                results.tolist(), index=df_valid.index
+            )
+
+            st.success("Calcul terminé !")
+
+            # KPIs (sur lignes valides)
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            mean_initial = df_valid["Price"].mean()
+            mean_optimized = df_valid["Nouveau_Prix"].mean()
+            diff = mean_optimized - mean_initial
+
+            kpi1.metric("Prix Moyen Initial", f"{mean_initial:.2f}€")
+            kpi2.metric("Prix Moyen Optimisé", f"{mean_optimized:.2f}€", delta=f"{diff:.2f}€")
+            kpi3.metric("Jours modifiés", f"{(df_valid['Statut'] != '⚪').sum()}")
+            kpi4.metric("Opportunités (hausse)", f"{(df_valid['Statut'] == '🟢').sum()}")
+
+            # Graphique (index sur _date_obj pour éviter tri cassé)
+            df_plot = df_valid.sort_values("_date_obj").set_index("_date_obj")[["Price", "Nouveau_Prix"]]
+            st.line_chart(df_plot)
+
+            # Tableau détaillé
+            def statut_color(v):
+                if v == "🟢":
+                    return "color: green; font-weight: 700;"
+                if v == "🔴":
+                    return "color: red; font-weight: 700;"
+                return ""
+
+            st.dataframe(
+                df_valid[[date_col, price_col, "Nouveau_Prix", "Ref_Concurrents", "Justification", "Statut"]]
+                .style.applymap(statut_color, subset=["Statut"]),
+                use_container_width=True,
+            )
+
+            # Export Excel (2 onglets : Optimisation + Erreurs)
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                df_export = df_valid.drop(columns=["_date_obj"], errors="ignore").copy()
+                df_export.to_excel(writer, index=False, sheet_name="Optimisation")
+
+                if len(df_errors) > 0:
+                    df_errors_export = df_errors.drop(columns=["_date_obj"], errors="ignore").copy()
+                    df_errors_export.to_excel(writer, index=False, sheet_name="Erreurs")
+
+            st.download_button("📥 Télécharger Excel Optimisé", output.getvalue(), "SmartPricing_Resultats.xlsx")
